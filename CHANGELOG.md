@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.1] - 2025-03-28
+
+### Added
+- Initial plugin framework implementation
+  - Plugin discovery and loading system
+  - Plugin metadata handling
+  - Tool discovery from plugins
+  - Dependency checking
+- Enhanced error handling
+  - Improved network error handling in GitHub tools
+  - Cross-platform directory permission handling
+  - API version compatibility checking
+
+### Changed
+- Optimized RAG document chunking strategies
+- Improved memory handling for large image processing
+- Enhanced CLI compatibility across different operating systems
+- Updated requirements.txt with stricter version constraints
+
+### Fixed
+- API compatibility issues with latest Anthropic SDK
+- Network error handling in GitHub API calls
+- Directory permission issues on different operating systems
+
 ## [1.7.0] - 2025-03-28
 
 ### Added

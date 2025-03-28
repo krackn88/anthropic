@@ -1,557 +1,289 @@
 """
 Security module for the Anthropic-powered Agent
+Handles input validation, rate limiting, and permissions
 """
 
-import re
 import time
+import re
 import hashlib
 import logging
-import functools
-import ipaddress
-import urllib.parse
-from typing import Dict, List, Any, Optional, Union, Callable, Set, Tuple
+import json
+from typing import Dict, List, Any, Optional, Union, Callable, Tuple
 from datetime import datetime, timedelta
-from threading import Lock
+from pydantic import BaseModel, ValidationError, create_model, validator
+from functools import wraps
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class InputValidator:
-    """Validate and sanitize inputs to prevent security issues."""
-    
-    @staticmethod
-    def validate_string(value: str, min_length: int = 0, max_length: int = 1000000, 
-                        pattern: Optional[str] = None, strip: bool = True) -> Tuple[bool, str, Optional[str]]:
-        """
-        Validate a string input.
-        
-        Args:
-            value: The string to validate
-            min_length: Minimum allowed length
-            max_length: Maximum allowed length
-            pattern: Regex pattern the string must match
-            strip: Whether to strip whitespace
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        # Check if value is a string
-        if not isinstance(value, str):
-            return False, "", f"Expected string, got {type(value).__name__}"
-        
-        # Strip whitespace if requested
-        if strip:
-            value = value.strip()
-        
-        # Check length constraints
-        if len(value) < min_length:
-            return False, value, f"Input is too short (minimum length: {min_length})"
-        
-        if len(value) > max_length:
-            # Truncate to max_length for the returned value
-            return False, value[:max_length], f"Input is too long (maximum length: {max_length})"
-        
-        # Check pattern
-        if pattern and not re.match(pattern, value):
-            return False, value, f"Input does not match required pattern"
-        
-        return True, value, None
-    
-    @staticmethod
-    def validate_integer(value: Any, min_value: Optional[int] = None, 
-                        max_value: Optional[int] = None) -> Tuple[bool, Optional[int], Optional[str]]:
-        """
-        Validate an integer input.
-        
-        Args:
-            value: The value to validate
-            min_value: Minimum allowed value
-            max_value: Maximum allowed value
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        # Try to convert to int
-        try:
-            if isinstance(value, str):
-                value = value.strip()
-            int_value = int(value)
-        except (ValueError, TypeError):
-            return False, None, f"Expected integer, got {type(value).__name__}"
-        
-        # Check range constraints
-        if min_value is not None and int_value < min_value:
-            return False, int_value, f"Value is too small (minimum: {min_value})"
-        
-        if max_value is not None and int_value > max_value:
-            return False, int_value, f"Value is too large (maximum: {max_value})"
-        
-        return True, int_value, None
-    
-    @staticmethod
-    def validate_float(value: Any, min_value: Optional[float] = None, 
-                      max_value: Optional[float] = None) -> Tuple[bool, Optional[float], Optional[str]]:
-        """
-        Validate a float input.
-        
-        Args:
-            value: The value to validate
-            min_value: Minimum allowed value
-            max_value: Maximum allowed value
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        # Try to convert to float
-        try:
-            if isinstance(value, str):
-                value = value.strip()
-            float_value = float(value)
-        except (ValueError, TypeError):
-            return False, None, f"Expected float, got {type(value).__name__}"
-        
-        # Check range constraints
-        if min_value is not None and float_value < min_value:
-            return False, float_value, f"Value is too small (minimum: {min_value})"
-        
-        if max_value is not None and float_value > max_value:
-            return False, float_value, f"Value is too large (maximum: {max_value})"
-        
-        return True, float_value, None
-    
-    @staticmethod
-    def validate_boolean(value: Any) -> Tuple[bool, Optional[bool], Optional[str]]:
-        """
-        Validate a boolean input.
-        
-        Args:
-            value: The value to validate
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        # Direct boolean
-        if isinstance(value, bool):
-            return True, value, None
-        
-        # String representation
-        if isinstance(value, str):
-            value = value.strip().lower()
-            if value in ('true', 't', 'yes', 'y', '1'):
-                return True, True, None
-            elif value in ('false', 'f', 'no', 'n', '0'):
-                return True, False, None
-        
-        # Integer representation
-        elif isinstance(value, int):
-            if value == 1:
-                return True, True, None
-            elif value == 0:
-                return True, False, None
-        
-        return False, None, f"Expected boolean, got {type(value).__name__}"
-    
-    @staticmethod
-    def validate_url(url: str, allowed_schemes: List[str] = ['http', 'https'], 
-                    allowed_domains: Optional[List[str]] = None) -> Tuple[bool, str, Optional[str]]:
-        """
-        Validate a URL.
-        
-        Args:
-            url: The URL to validate
-            allowed_schemes: List of allowed URL schemes
-            allowed_domains: Optional list of allowed domains
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        if not isinstance(url, str):
-            return False, "", f"Expected string, got {type(url).__name__}"
-        
-        # Strip whitespace
-        url = url.strip()
-        
-        try:
-            # Parse URL
-            parsed = urllib.parse.urlparse(url)
-            
-            # Check scheme
-            if parsed.scheme not in allowed_schemes:
-                return False, url, f"URL scheme not allowed (allowed: {', '.join(allowed_schemes)})"
-            
-            # Check domain if restricted
-            if allowed_domains:
-                domain = parsed.netloc.lower()
-                if not any(domain.endswith(d.lower()) for d in allowed_domains):
-                    return False, url, f"URL domain not allowed (allowed: {', '.join(allowed_domains)})"
-            
-            # Check if URL has at least a scheme and netloc
-            if not (parsed.scheme and parsed.netloc):
-                return False, url, "URL must include both scheme and domain"
-            
-            return True, url, None
-        
-        except Exception as e:
-            return False, url, f"Invalid URL: {str(e)}"
-    
-    @staticmethod
-    def validate_email(email: str) -> Tuple[bool, str, Optional[str]]:
-        """
-        Validate an email address.
-        
-        Args:
-            email: The email to validate
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        if not isinstance(email, str):
-            return False, "", f"Expected string, got {type(email).__name__}"
-        
-        # Strip whitespace
-        email = email.strip()
-        
-        # Simple regex for email validation
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        
-        if re.match(email_pattern, email):
-            return True, email, None
-        else:
-            return False, email, "Invalid email format"
-    
-    @staticmethod
-    def validate_ip_address(ip: str) -> Tuple[bool, str, Optional[str]]:
-        """
-        Validate an IP address (IPv4 or IPv6).
-        
-        Args:
-            ip: The IP address to validate
-            
-        Returns:
-            (is_valid, sanitized_value, error_message)
-        """
-        if not isinstance(ip, str):
-            return False, "", f"Expected string, got {type(ip).__name__}"
-        
-        # Strip whitespace
-        ip = ip.strip()
-        
-        try:
-            ipaddress.ip_address(ip)
-            return True, ip, None
-        except ValueError:
-            return False, ip, "Invalid IP address format"
-    
-    @staticmethod
-    def sanitize_html(html: str) -> str:
-        """
-        Sanitize HTML content to prevent XSS attacks.
-        Removes all tags except for a whitelist of safe tags.
-        
-        Args:
-            html: The HTML content to sanitize
-            
-        Returns:
-            Sanitized HTML
-        """
-        # Define allowed tags and attributes
-        allowed_tags = [
-            'a', 'abbr', 'acronym', 'b', 'blockquote', 'br', 'code', 'div', 'em',
-            'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'i', 'img', 'kbd', 'li', 'ol', 
-            'p', 'pre', 'q', 's', 'span', 'strong', 'sub', 'sup', 'table', 'tbody', 
-            'td', 'tfoot', 'th', 'thead', 'tr', 'tt', 'u', 'ul'
-        ]
-        
-        allowed_attrs = {
-            'a': ['href', 'title', 'target', 'rel'],
-            'img': ['src', 'alt', 'title', 'width', 'height'],
-            'div': ['class'],
-            'span': ['class'],
-            'p': ['class'],
-            'pre': ['class'],
-            'code': ['class'],
-            'table': ['class', 'width'],
-            'th': ['colspan', 'rowspan'],
-            'td': ['colspan', 'rowspan']
-        }
-        
-        # Simple tag stripping (a more robust solution would use a proper HTML parser)
-        # Replace this with a proper HTML sanitizer library in production
-        
-        # First, replace < and > in non-tag context
-        escaped_html = re.sub(r'&(?![a-z]+;)', '&amp;', html)
-        
-        # Strip all tags
-        sanitized = re.sub(r'<[^>]*>', '', escaped_html)
-        
-        return sanitized
-    
-    @staticmethod
-    def validate_json(json_str: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-        """
-        Validate a JSON string.
-        
-        Args:
-            json_str: The JSON string to validate
-            
-        Returns:
-            (is_valid, parsed_json, error_message)
-        """
-        import json
-        
-        if not isinstance(json_str, str):
-            return False, None, f"Expected string, got {type(json_str).__name__}"
-        
-        try:
-            parsed = json.loads(json_str)
-            return True, parsed, None
-        except json.JSONDecodeError as e:
-            return False, None, f"Invalid JSON: {str(e)}"
-
 class RateLimiter:
-    """Rate limiting implementation to prevent abuse."""
+    """Rate limiting implementation using token bucket algorithm."""
     
-    def __init__(self, limit: int, window: int = 60):
+    def __init__(self, rate: float, capacity: int):
         """
         Initialize rate limiter.
         
         Args:
-            limit: Maximum number of requests per window
-            window: Time window in seconds
+            rate: Tokens per second to refill
+            capacity: Maximum token bucket capacity
         """
-        self.limit = limit
-        self.window = window
-        self.request_counts = {}  # key -> list of timestamps
-        self.lock = Lock()
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = capacity
+        self.last_time = time.time()
+        self.user_buckets = {}  # For user-specific rate limiting
+        self.ip_buckets = {}    # For IP-based rate limiting
     
-    def is_allowed(self, key: str) -> bool:
+    def check_and_update(self, tokens: int = 1) -> bool:
         """
-        Check if a request is allowed based on the rate limit.
+        Check if operation is allowed and update token count.
         
         Args:
-            key: Identifier for the client (e.g., API key, IP address)
+            tokens: Number of tokens to consume (default: 1)
             
         Returns:
-            True if request is allowed, False otherwise
+            True if operation is allowed, False otherwise
         """
-        with self.lock:
-            now = time.time()
-            
-            # Initialize or clean up old entries
-            if key not in self.request_counts:
-                self.request_counts[key] = []
-            
-            # Remove entries outside the current window
-            window_start = now - self.window
-            self.request_counts[key] = [t for t in self.request_counts[key] if t >= window_start]
-            
-            # Check if limit has been reached
-            if len(self.request_counts[key]) >= self.limit:
-                return False
-            
-            # Record this request
-            self.request_counts[key].append(now)
+        current_time = time.time()
+        time_passed = current_time - self.last_time
+        self.last_time = current_time
+        
+        # Refill tokens based on time passed
+        self.tokens = min(self.capacity, self.tokens + time_passed * self.rate)
+        
+        # Check if we have enough tokens
+        if self.tokens >= tokens:
+            self.tokens -= tokens
             return True
+        else:
+            return False
     
-    def get_retry_after(self, key: str) -> int:
+    def check_user(self, user_id: str, tokens: int = 1) -> bool:
         """
-        Get the number of seconds to wait before retrying.
+        Check rate limit for a specific user.
         
         Args:
-            key: Identifier for the client
+            user_id: User identifier
+            tokens: Number of tokens to consume
             
         Returns:
-            Seconds to wait before the next request would be allowed
+            True if operation is allowed, False otherwise
         """
-        with self.lock:
-            if key not in self.request_counts or not self.request_counts[key]:
-                return 0
-            
-            now = time.time()
-            oldest_request = min(self.request_counts[key])
-            next_allowed = oldest_request + self.window
-            
-            retry_after = max(0, int(next_allowed - now))
-            return retry_after
+        # Initialize user bucket if needed
+        if user_id not in self.user_buckets:
+            self.user_buckets[user_id] = {
+                "tokens": self.capacity,
+                "last_time": time.time()
+            }
+        
+        # Get user bucket
+        bucket = self.user_buckets[user_id]
+        current_time = time.time()
+        time_passed = current_time - bucket["last_time"]
+        bucket["last_time"] = current_time
+        
+        # Refill tokens based on time passed
+        bucket["tokens"] = min(self.capacity, bucket["tokens"] + time_passed * self.rate)
+        
+        # Check if we have enough tokens
+        if bucket["tokens"] >= tokens:
+            bucket["tokens"] -= tokens
+            return True
+        else:
+            return False
     
-    def reset(self, key: str):
+    def check_ip(self, ip_address: str, tokens: int = 1) -> bool:
         """
-        Reset rate limit counter for a key.
+        Check rate limit for a specific IP address.
         
         Args:
-            key: Identifier for the client
+            ip_address: IP address
+            tokens: Number of tokens to consume
+            
+        Returns:
+            True if operation is allowed, False otherwise
         """
-        with self.lock:
-            if key in self.request_counts:
-                del self.request_counts[key]
+        # Similar to check_user, but for IP addresses
+        if ip_address not in self.ip_buckets:
+            self.ip_buckets[ip_address] = {
+                "tokens": self.capacity,
+                "last_time": time.time()
+            }
+        
+        bucket = self.ip_buckets[ip_address]
+        current_time = time.time()
+        time_passed = current_time - bucket["last_time"]
+        bucket["last_time"] = current_time
+        
+        bucket["tokens"] = min(self.capacity, bucket["tokens"] + time_passed * self.rate)
+        
+        if bucket["tokens"] >= tokens:
+            bucket["tokens"] -= tokens
+            return True
+        else:
+            return False
+
+class InputValidator:
+    """Validate and sanitize inputs to prevent security issues."""
+    
+    @staticmethod
+    def sanitize_string(input_string: str, max_length: int = 10000) -> str:
+        """
+        Sanitize a string input.
+        
+        Args:
+            input_string: Input string to sanitize
+            max_length: Maximum allowed length
+            
+        Returns:
+            Sanitized string
+        """
+        if not input_string:
+            return ""
+        
+        # Truncate if too long
+        if len(input_string) > max_length:
+            input_string = input_string[:max_length]
+        
+        # Remove potentially malicious characters
+        # This is a basic example - more advanced sanitization might be needed
+        sanitized = re.sub(r'[^\w\s\.\,\!\?\-\:\;\(\)\[\]\{\}\"\'\`\/\+\=\*\&\%\$\#\@\~]', '', input_string)
+        
+        return sanitized
+    
+    @staticmethod
+    def validate_email(email: str) -> bool:
+        """
+        Validate an email address.
+        
+        Args:
+            email: Email address to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(email_pattern, email))
+    
+    @staticmethod
+    def validate_url(url: str) -> bool:
+        """
+        Validate a URL.
+        
+        Args:
+            url: URL to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        url_pattern = r'^(https?|ftp)://[^\s/$.?#].[^\s]*$'
+        return bool(re.match(url_pattern, url))
+    
+    @staticmethod
+    def validate_path(path: str) -> bool:
+        """
+        Validate a file path to prevent path traversal attacks.
+        
+        Args:
+            path: File path to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        # Check for path traversal sequences
+        if '..' in path or '~' in path:
+            return False
+        
+        # Disallow absolute paths
+        if path.startswith('/') or (len(path) > 1 and path[1] == ':'):
+            return False
+        
+        return True
+    
+    @staticmethod
+    def create_validator_model(schema: Dict[str, Any]) -> BaseModel:
+        """
+        Create a Pydantic model for validation based on a schema.
+        
+        Args:
+            schema: Schema definition
+            
+        Returns:
+            Pydantic model class
+        """
+        field_definitions = {}
+        
+        for field_name, field_def in schema.get("properties", {}).items():
+            field_type = field_def.get("type", "string")
+            
+            # Map JSON Schema types to Python types
+            type_mapping = {
+                "string": str,
+                "integer": int,
+                "number": float,
+                "boolean": bool,
+                "array": list,
+                "object": dict
+            }
+            
+            python_type = type_mapping.get(field_type, str)
+            is_required = field_name in schema.get("required", [])
+            
+            if is_required:
+                field_definitions[field_name] = (python_type, ...)
+            else:
+                field_definitions[field_name] = (Optional[python_type], None)
+        
+        # Create and return model
+        return create_model('DynamicModel', **field_definitions)
 
 class PermissionSystem:
-    """Permission system for controlling access to tools."""
-    
-    # Permission levels from lowest to highest
-    PERMISSION_LEVELS = ["none", "read", "write", "admin"]
+    """Manage permissions for tools and resources."""
     
     def __init__(self):
         """Initialize the permission system."""
-        self.role_permissions = {
-            "guest": {
-                "default": "none",
-                "categories": {
-                    "claude": "read"
-                }
+        self.roles = {
+            "admin": {"description": "Full access to all tools and resources"},
+            "user": {"description": "Standard user with limited access"},
+            "guest": {"description": "Read-only access to basic resources"}
+        }
+        
+        self.permissions = {
+            "admin": {"*": "rw"},  # Full access to everything
+            "user": {               # Standard user permissions
+                "github": "rw",
+                "claude_tools": "rw",
+                "system_tools": "r",  # Read-only for system tools
+                "rag": "rw",
+                "image": "rw"
             },
-            "user": {
-                "default": "read",
-                "categories": {
-                    "github": "read",
-                    "claude": "read",
-                    "system": "read",
-                    "rag": "read",
-                    "image": "read",
-                    "cookbook": "read"
-                }
-            },
-            "power_user": {
-                "default": "read",
-                "categories": {
-                    "github": "write",
-                    "claude": "write",
-                    "system": "write",
-                    "rag": "write",
-                    "image": "write",
-                    "cookbook": "write"
-                }
-            },
-            "admin": {
-                "default": "admin",
-                "categories": {}
+            "guest": {              # Guest permissions
+                "github": "r",       # Read-only for GitHub
+                "claude_tools": "r",  # Read-only for Claude tools
+                "rag": "r",           # Read-only for RAG
+                "image": "r"          # Read-only for images
             }
         }
         
-        self.user_roles = {}  # user_id -> role
-        self.user_permissions = {}  # user_id -> {category -> level}
-        self.tool_permissions = {}  # tool_name -> required_level
+        self.user_roles = {}  # Map of user IDs to roles
     
-    def assign_role(self, user_id: str, role: str):
+    def assign_role(self, user_id: str, role: str) -> bool:
         """
         Assign a role to a user.
         
         Args:
             user_id: User identifier
             role: Role to assign
-        """
-        if role not in self.role_permissions:
-            raise ValueError(f"Unknown role: {role}")
-        
-        self.user_roles[user_id] = role
-        self._update_user_permissions(user_id)
-    
-    def _update_user_permissions(self, user_id: str):
-        """
-        Update user permissions based on their role.
-        
-        Args:
-            user_id: User identifier
-        """
-        if user_id not in self.user_roles:
-            return
-        
-        role = self.user_roles[user_id]
-        role_perms = self.role_permissions[role]
-        
-        # Initialize with default permission
-        user_perms = {"default": role_perms["default"]}
-        
-        # Add category-specific permissions
-        for category, level in role_perms["categories"].items():
-            user_perms[category] = level
-        
-        self.user_permissions[user_id] = user_perms
-    
-    def set_tool_permission(self, tool_name: str, required_level: str):
-        """
-        Set the permission level required for a tool.
-        
-        Args:
-            tool_name: Tool identifier
-            required_level: Required permission level
-        """
-        if required_level not in self.PERMISSION_LEVELS:
-            raise ValueError(f"Invalid permission level: {required_level}")
-        
-        self.tool_permissions[tool_name] = required_level
-    
-    def set_category_permissions(self, category: str, required_level: str):
-        """
-        Set the permission level required for all tools in a category.
-        
-        Args:
-            category: Tool category
-            required_level: Required permission level
-        """
-        if required_level not in self.PERMISSION_LEVELS:
-            raise ValueError(f"Invalid permission level: {required_level}")
-        
-        # This is used when registering tools
-        # The actual application happens in register_tool_permissions
-        self.category_permission = {category: required_level}
-    
-    def register_tool_permissions(self, tools: Dict[str, Any], tool_categories: Dict[str, List[str]]):
-        """
-        Register permissions for a set of tools based on their categories.
-        
-        Args:
-            tools: Dictionary of tools (name -> tool object)
-            tool_categories: Dictionary of categories (category -> list of tool names)
-        """
-        # Set default permission for all tools to "read"
-        for tool_name in tools:
-            if tool_name not in self.tool_permissions:
-                self.tool_permissions[tool_name] = "read"
-        
-        # Apply category-based permissions
-        for category, tool_names in tool_categories.items():
-            for tool_name in tool_names:
-                if category in self.category_permission:
-                    self.tool_permissions[tool_name] = self.category_permission[category]
-    
-    def has_permission(self, user_id: str, tool_name: str) -> bool:
-        """
-        Check if a user has permission to use a tool.
-        
-        Args:
-            user_id: User identifier
-            tool_name: Tool identifier
             
         Returns:
-            True if user has permission, False otherwise
+            True if successful, False otherwise
         """
-        # Admin always has permission
-        if self.get_user_role(user_id) == "admin":
-            return True
-        
-        # Get user's permissions
-        if user_id not in self.user_permissions:
+        if role not in self.roles:
             return False
         
-        user_perms = self.user_permissions[user_id]
-        
-        # Get tool's required permission level
-        tool_level = self.tool_permissions.get(tool_name, "read")
-        
-        # Find the tool's category
-        tool_category = None
-        for category, tool_names in tool_categories.items():
-            if tool_name in tool_names:
-                tool_category = category
-                break
-        
-        # Use category-specific permission level if available, else use default
-        user_level = user_perms.get(tool_category, user_perms["default"])
-        
-        # Check permission
-        return self.PERMISSION_LEVELS.index(user_level) >= self.PERMISSION_LEVELS.index(tool_level)
+        self.user_roles[user_id] = role
+        return True
     
     def get_user_role(self, user_id: str) -> str:
         """
@@ -561,145 +293,142 @@ class PermissionSystem:
             user_id: User identifier
             
         Returns:
-            User's role, or "guest" if not assigned
+            Role name or 'guest' if not assigned
         """
         return self.user_roles.get(user_id, "guest")
     
-    def get_allowed_tools(self, user_id: str, available_tools: Dict[str, Any]) -> List[str]:
+    def check_permission(self, user_id: str, resource: str, access_type: str) -> bool:
         """
-        Get a list of tool names that a user has permission to use.
+        Check if a user has permission to access a resource.
         
         Args:
             user_id: User identifier
-            available_tools: Dictionary of available tools
+            resource: Resource to access (e.g., 'github', 'system_tools')
+            access_type: Type of access ('r' for read, 'w' for write)
             
         Returns:
-            List of tool names the user can use
+            True if allowed, False otherwise
         """
-        return [name for name in available_tools if self.has_permission(user_id, name)]
+        role = self.get_user_role(user_id)
+        role_permissions = self.permissions.get(role, {})
+        
+        # Check for wildcard permission
+        if "*" in role_permissions and access_type in role_permissions["*"]:
+            return True
+        
+        # Check for specific resource permission
+        if resource in role_permissions and access_type in role_permissions[resource]:
+            return True
+        
+        # Check for category permissions (if resource contains '.')
+        if "." in resource:
+            category = resource.split(".")[0]
+            if category in role_permissions and access_type in role_permissions[category]:
+                return True
+        
+        return False
+    
+    def permission_required(self, resource: str, access_type: str):
+        """
+        Decorator for functions that require permission.
+        
+        Args:
+            resource: Resource to access
+            access_type: Type of access ('r' for read, 'w' for write)
+            
+        Returns:
+            Decorator function
+        """
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*args, **kwargs):
+                # Get user_id from kwargs
+                user_id = kwargs.get("user_id")
+                
+                if not user_id:
+                    # Try to extract from first argument if it's a dict-like object
+                    if args and hasattr(args[0], "get"):
+                        user_id = args[0].get("user_id")
+                
+                if not user_id:
+                    return {"error": "User identification required"}
+                
+                # Check permission
+                if not self.check_permission(user_id, resource, access_type):
+                    return {"error": f"Permission denied: {resource}:{access_type}"}
+                
+                # Call original function
+                return await func(*args, **kwargs)
+            
+            return wrapper
+        
+        return decorator
 
-# Helper functions
+# Create singleton instances for global use
+global_rate_limiter = RateLimiter(rate=10, capacity=20)  # 10 tokens per second, max 20
+global_permission_system = PermissionSystem()
 
-def validate_tool_parameters(parameters: Dict[str, Any], tool_parameters: List[Any]) -> Tuple[bool, Dict[str, Any], List[str]]:
+def validate_input(validator_func: Callable) -> Callable:
     """
-    Validate parameters for a tool based on its parameter definitions.
+    Decorator to validate inputs.
     
     Args:
-        parameters: Parameter values to validate
-        tool_parameters: List of parameter definitions
-        
-    Returns:
-        (is_valid, validated_parameters, error_messages)
-    """
-    # Initialize output
-    validated = {}
-    errors = []
-    
-    # Create lookup for parameter definitions
-    param_defs = {p.name: p for p in tool_parameters}
-    
-    # Check for missing required parameters
-    for name, param_def in param_defs.items():
-        if param_def.required and name not in parameters:
-            errors.append(f"Missing required parameter: {name}")
-    
-    # Validate each provided parameter
-    for name, value in parameters.items():
-        if name not in param_defs:
-            errors.append(f"Unknown parameter: {name}")
-            continue
-        
-        param_def = param_defs[name]
-        param_type = param_def.type
-        
-        # Validate based on type
-        if param_type == "string":
-            is_valid, sanitized, error = InputValidator.validate_string(value)
-            if not is_valid:
-                errors.append(f"{name}: {error}")
-            else:
-                validated[name] = sanitized
-        
-        elif param_type == "integer":
-            is_valid, sanitized, error = InputValidator.validate_integer(value)
-            if not is_valid:
-                errors.append(f"{name}: {error}")
-            else:
-                validated[name] = sanitized
-        
-        elif param_type == "number":
-            is_valid, sanitized, error = InputValidator.validate_float(value)
-            if not is_valid:
-                errors.append(f"{name}: {error}")
-            else:
-                validated[name] = sanitized
-        
-        elif param_type == "boolean":
-            is_valid, sanitized, error = InputValidator.validate_boolean(value)
-            if not is_valid:
-                errors.append(f"{name}: {error}")
-            else:
-                validated[name] = sanitized
-        
-        else:
-            # For complex types, we'll do basic validation
-            validated[name] = value
-    
-    # Use default values for non-provided optional parameters
-    for name, param_def in param_defs.items():
-        if not param_def.required and name not in parameters and param_def.default is not None:
-            validated[name] = param_def.default
-    
-    return len(errors) == 0, validated, errors
-
-def secure_hash(value: str) -> str:
-    """
-    Create a secure hash of a string.
-    
-    Args:
-        value: String to hash
-        
-    Returns:
-        Secure hash
-    """
-    return hashlib.sha256(value.encode()).hexdigest()
-
-def rate_limit_decorator(limiter: RateLimiter, key_func: Callable = lambda *args, **kwargs: "default"):
-    """
-    Decorator for rate limiting function calls.
-    
-    Args:
-        limiter: RateLimiter instance
-        key_func: Function to extract key from arguments
+        validator_func: Function that returns (is_valid, error_message)
         
     Returns:
         Decorator function
     """
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            key = key_func(*args, **kwargs)
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Validate inputs
+            valid, error = validator_func(*args, **kwargs)
+            if not valid:
+                return {"error": error}
             
-            if not limiter.is_allowed(key):
-                retry_after = limiter.get_retry_after(key)
-                raise RateLimitExceeded(f"Rate limit exceeded. Try again in {retry_after} seconds.")
-            
-            return func(*args, **kwargs)
+            # Call original function
+            return await func(*args, **kwargs)
+        
         return wrapper
+    
     return decorator
 
-class SecurityException(Exception):
-    """Base class for security-related exceptions."""
-    pass
-
-class ValidationError(SecurityException):
-    """Exception raised for validation errors."""
-    pass
-
-class PermissionDenied(SecurityException):
-    """Exception raised when permission is denied."""
-    pass
-
-class RateLimitExceeded(SecurityException):
-    """Exception raised when rate limit is exceeded."""
-    pass
+def rate_limit(tokens: int = 1, limit_by: str = "global") -> Callable:
+    """
+    Rate limiting decorator.
+    
+    Args:
+        tokens: Number of tokens to consume
+        limit_by: 'global', 'user', or 'ip' to determine rate limit scope
+        
+    Returns:
+        Decorator function
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Apply rate limiting
+            if limit_by == "global":
+                allowed = global_rate_limiter.check_and_update(tokens)
+            elif limit_by == "user":
+                user_id = kwargs.get("user_id")
+                if not user_id:
+                    return {"error": "User ID required for user-based rate limiting"}
+                allowed = global_rate_limiter.check_user(user_id, tokens)
+            elif limit_by == "ip":
+                ip_address = kwargs.get("ip_address")
+                if not ip_address:
+                    return {"error": "IP address required for IP-based rate limiting"}
+                allowed = global_rate_limiter.check_ip(ip_address, tokens)
+            else:
+                allowed = True  # Default to allowed if invalid limit_by
+            
+            if not allowed:
+                return {"error": "Rate limit exceeded. Please try again later."}
+            
+            # Call original function
+            return await func(*args, **kwargs)
+        
+        return wrapper
+    
+    return decorator
